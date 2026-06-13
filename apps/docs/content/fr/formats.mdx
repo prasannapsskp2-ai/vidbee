@@ -1,0 +1,33 @@
+---
+title: Formats et conteneurs
+description: Choisissez le conteneur de sortie pour les téléchargements en un clic (Auto, MP4, MKV, WebM, Original) et comprenez les compromis.
+---
+
+VidBee enregistre les téléchargements vidéo fusionnés au format MP4 par défaut et bascule vers MKV lorsque les codecs ne sont pas compatibles. Vous pouvez modifier ce choix depuis **Paramètres → Téléchargement en un clic → Conteneur**.
+
+## Options de conteneur
+
+| Option | Comportement yt-dlp | Quand l'utiliser |
+|---|---|---|
+| **Auto (MP4/MKV)** | `--merge-output-format mp4/mkv` — préfère MP4, bascule vers MKV si les codecs ne peuvent pas être fusionnés en MP4. | Valeur par défaut. Maximise la compatibilité tout en évitant les échecs de fusion (HEVC + audio haute résolution sur bilibili, fragments WebM sur YouTube, etc.). |
+| **MP4** | `--merge-output-format mp4 --remux-video mp4` | Vous voulez spécifiquement du MP4 (compatibilité maximale avec QuickTime, iOS, mises en ligne sociales). Peut échouer sur des flux dont les codecs ne tiennent pas dans MP4 — repassez sur **Auto** si une erreur `Conversion failed` apparaît. |
+| **MKV** | `--merge-output-format mkv --remux-video mkv` | Conteneur le plus permissif, capable de transporter tout codec récupéré par yt-dlp. |
+| **WebM** | `--merge-output-format webm --remux-video webm` | Fichiers les plus petits pour les flux VP9/AV1 + Opus de YouTube. Échouera quand les sources distantes ne sont qu'en AAC/H.264. |
+| **Original (par défaut yt-dlp)** | Aucun argument `--merge-output-format`. | Vous voulez les valeurs par défaut intégrées de yt-dlp (MKV lors d'une fusion, extension source en flux unique). |
+
+## Téléchargements audio
+
+Le choix du conteneur s'applique uniquement aux téléchargements **vidéo**. Les téléchargements audio en un clic conservent le conteneur audio préféré de la plateforme (généralement M4A / MP3 / Opus).
+
+## Emplacement du paramètre
+
+- **Bureau** : Paramètres → Général → carte Téléchargement en un clic → Conteneur.
+- **Web** : Page Paramètres → Téléchargement en un clic → Conteneur.
+
+Le réglage est enregistré immédiatement et s'applique aux téléchargements manuels en un clic comme aux téléchargements d'abonnement RSS.
+
+## Pourquoi MP4 finit-il parfois en MKV ?
+
+Lorsque **Auto** est sélectionné et que la combinaison codec/audio source ne peut pas être fusionnée en MP4, yt-dlp écrit un fichier MKV avec les codecs d'origine pour éviter toute perte de qualité. Pour forcer MP4, basculez sur **MP4** ; le téléchargement échouera avec une erreur de codec claire s'il ne peut pas être fusionné au lieu de choisir silencieusement MKV.
+
+Si vous voulez du MP4 depuis une source non MP4 sans risquer l'échec, l'unique alternative est le ré-encodage (lent, avec perte). VidBee n'expose que le remux ; le ré-encodage n'est volontairement pas proposé.

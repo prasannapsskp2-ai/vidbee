@@ -1,0 +1,14 @@
+{
+  "title": "Documentation VidBee",
+  "pages": [
+    "index",
+    "---Téléchargement & Accès---",
+    "protocol",
+    "formats",
+    "cookies",
+    "---Automatisation---",
+    "rss",
+    "---Aide---",
+    "faq"
+  ]
+}

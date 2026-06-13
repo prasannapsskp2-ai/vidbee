@@ -1,0 +1,18 @@
+# Ignore yt-dlp binaries (too large for git)
+*.tmp
+yt-dlp.exe
+yt-dlp_macos
+yt-dlp_linux
+ffmpeg.exe
+ffmpeg_macos
+ffmpeg_linux
+ffmpeg
+ffmpeg/
+ffprobe
+ffprobe.exe
+deno.exe
+deno
+
+# But keep the README
+!README.md
+!.gitignore

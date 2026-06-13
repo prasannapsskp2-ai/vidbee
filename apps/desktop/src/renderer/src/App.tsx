@@ -1,0 +1,298 @@
+import { Sidebar } from '@renderer/components/ui/sidebar'
+import { Toaster } from '@renderer/components/ui/sonner'
+import { TitleBar } from '@renderer/components/ui/title-bar'
+import type { SubscriptionRule } from '@shared/types'
+import { useAtom, useSetAtom } from 'jotai'
+import { ThemeProvider } from 'next-themes'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router'
+import { toast } from 'sonner'
+import { ErrorBoundary } from './components/error/ErrorBoundary'
+import { useDownloadEvents } from './hooks/use-download-events'
+import { useRybbitDailyClientVersion } from './hooks/use-rybbit-daily-client-version'
+import { useRybbitScript } from './hooks/use-rybbit-script'
+import { addRendererBreadcrumb, setRendererTelemetryEnabled } from './lib/glitchtip'
+import { ipcEvents, ipcServices } from './lib/ipc'
+import { withDesktopUtm } from './lib/url'
+import { About } from './pages/About'
+import { Home } from './pages/Home'
+import { Settings } from './pages/Settings'
+import { Subscriptions } from './pages/Subscriptions'
+import { loadSettingsAtom, settingsAtom } from './store/settings'
+import { loadSubscriptionsAtom, setSubscriptionsAtom } from './store/subscriptions'
+import { updateAvailableAtom, updateReadyAtom } from './store/update'
+
+type Page = 'home' | 'subscriptions' | 'settings' | 'about'
+
+const pageToPath: Record<Page, string> = {
+  home: '/',
+  subscriptions: '/subscriptions',
+  settings: '/settings',
+  about: '/about'
+}
+
+const normalizePathname = (pathname: string): string => {
+  const trimmed = pathname.replace(/\/+$/, '')
+  return trimmed === '' ? '/' : trimmed
+}
+
+const pathToPage = (pathname: string): Page => {
+  const normalized = normalizePathname(pathname)
+  switch (normalized) {
+    case '/subscriptions':
+      return 'subscriptions'
+    case '/settings':
+      return 'settings'
+    case '/about':
+      return 'about'
+    default:
+      return 'home'
+  }
+}
+
+function AppContent() {
+  const [platform, setPlatform] = useState<string>('')
+  const [appVersion, setAppVersion] = useState<string>('')
+  const loadSubscriptions = useSetAtom(loadSubscriptionsAtom)
+  const setSubscriptions = useSetAtom(setSubscriptionsAtom)
+  const [settings] = useAtom(settingsAtom)
+  const loadSettings = useSetAtom(loadSettingsAtom)
+  const setUpdateReady = useSetAtom(updateReadyAtom)
+  const setUpdateAvailable = useSetAtom(updateAvailableAtom)
+  const { i18n } = useTranslation()
+  const updateDownloadInProgressRef = useRef(false)
+  const navigate = useNavigate()
+  const location = useLocation()
+  const currentPage = pathToPage(location.pathname)
+  const supportedSitesUrl = withDesktopUtm('https://vidbee.org/supported-sites/')
+  const toolsUrl = withDesktopUtm('https://vidbee.org/tools/')
+  const analyticsEnabled = settings.enableAnalytics ?? true
+  const isRybbitReady = useRybbitScript(analyticsEnabled)
+
+  useDownloadEvents()
+  useRybbitDailyClientVersion({
+    appName: 'VidBee',
+    enabled: analyticsEnabled,
+    isReady: isRybbitReady,
+    platform,
+    version: appVersion
+  })
+
+  const handlePageChange = useCallback(
+    (page: Page) => {
+      const targetPath = pageToPath[page] ?? '/'
+      if (normalizePathname(location.pathname) !== targetPath) {
+        addRendererBreadcrumb('navigation', 'Navigated to page', {
+          page,
+          targetPath
+        })
+        navigate(targetPath)
+      }
+    },
+    [location.pathname, navigate]
+  )
+
+  const handleOpenCookiesSettings = useCallback(() => {
+    navigate('/settings?tab=cookies')
+  }, [navigate])
+
+  const handleOpenSupportedSites = () => {
+    window.open(supportedSitesUrl, '_blank')
+  }
+
+  const handleOpenTools = () => {
+    window.open(toolsUrl, '_blank')
+  }
+
+  useEffect(() => {
+    setRendererTelemetryEnabled(analyticsEnabled)
+  }, [analyticsEnabled])
+
+  useEffect(() => {
+    loadSettings()
+  }, [loadSettings])
+
+  useEffect(() => {
+    const handleDeepLink = (rawUrl: unknown) => {
+      const url = typeof rawUrl === 'string' ? rawUrl.trim() : ''
+      if (!url) {
+        return
+      }
+      // Switch to home page to show download dialog
+      handlePageChange('home')
+      // The DownloadDialog component will handle opening the dialog and parsing the video
+    }
+
+    ipcEvents.on('download:deeplink', handleDeepLink)
+    return () => {
+      ipcEvents.removeListener('download:deeplink', handleDeepLink)
+    }
+  }, [handlePageChange])
+
+  useEffect(() => {
+    loadSubscriptions()
+
+    const handleSubscriptions = (...args: unknown[]) => {
+      const list = args[0]
+      if (Array.isArray(list)) {
+        setSubscriptions(list as SubscriptionRule[])
+      }
+    }
+
+    ipcEvents.on('subscriptions:updated', handleSubscriptions)
+
+    return () => {
+      ipcEvents.removeListener('subscriptions:updated', handleSubscriptions)
+    }
+  }, [loadSubscriptions, setSubscriptions])
+
+  useEffect(() => {
+    const getRuntimeInfo = async () => {
+      try {
+        const [platformInfo, version] = await Promise.all([
+          ipcServices.app.getPlatform(),
+          ipcServices.app.getVersion()
+        ])
+        setPlatform(platformInfo)
+        setAppVersion(version)
+      } catch (error) {
+        console.error('Failed to get runtime info:', error)
+        setPlatform('unknown')
+        setAppVersion('')
+      }
+    }
+
+    void getRuntimeInfo()
+  }, [])
+
+  useEffect(() => {
+    if (!window?.api) {
+      return
+    }
+
+    const resetDownloadState = () => {
+      if (updateDownloadInProgressRef.current) {
+        updateDownloadInProgressRef.current = false
+      }
+    }
+
+    const handleUpdateAvailable = (rawInfo: unknown) => {
+      const info = (rawInfo ?? {}) as { version?: string }
+      setUpdateAvailable({
+        available: true,
+        version: info.version
+      })
+    }
+
+    const handleUpdateDownloaded = (rawInfo: unknown) => {
+      const info = (rawInfo ?? {}) as { version?: string }
+      resetDownloadState()
+      setUpdateReady({
+        ready: true,
+        version: info.version
+      })
+      setUpdateAvailable({
+        available: true,
+        version: info.version
+      })
+
+      const versionLabel = info?.version ?? ''
+      const downloadedMessage = versionLabel
+        ? i18n.t('about.notifications.updateDownloadedVersion', { version: versionLabel })
+        : i18n.t('about.notifications.updateDownloaded')
+      toast.info(downloadedMessage, {
+        action: {
+          label: i18n.t('about.notifications.restartNowAction'),
+          onClick: () => {
+            void ipcServices.update.quitAndInstall()
+          }
+        }
+      })
+    }
+
+    const handleUpdateError = (rawMessage: unknown) => {
+      const message = typeof rawMessage === 'string' ? rawMessage : ''
+      resetDownloadState()
+
+      const errorMessage = message || i18n.t('about.notifications.unknownErrorFallback')
+      toast.error(i18n.t('about.notifications.updateError', { error: errorMessage }))
+    }
+
+    const handleDownloadProgress = (rawProgress: unknown) => {
+      const progress = (rawProgress ?? {}) as { percent?: number }
+      if (typeof progress?.percent === 'number') {
+        console.info('Update download progress:', progress.percent.toFixed(2))
+      }
+    }
+
+    // Only listen to update events that should be shown globally
+    // update:available shows a visual indicator in the sidebar
+    ipcEvents.on('update:available', handleUpdateAvailable)
+    ipcEvents.on('update:downloaded', handleUpdateDownloaded)
+    ipcEvents.on('update:error', handleUpdateError)
+    ipcEvents.on('update:download-progress', handleDownloadProgress)
+
+    return () => {
+      ipcEvents.removeListener('update:available', handleUpdateAvailable)
+      ipcEvents.removeListener('update:downloaded', handleUpdateDownloaded)
+      ipcEvents.removeListener('update:error', handleUpdateError)
+      ipcEvents.removeListener('update:download-progress', handleDownloadProgress)
+    }
+  }, [i18n, setUpdateAvailable, setUpdateReady])
+
+  return (
+    <div className="flex h-screen flex-row">
+      {/* Sidebar Navigation */}
+      <Sidebar
+        currentPage={currentPage}
+        onOpenSupportedSites={handleOpenSupportedSites}
+        onOpenTools={handleOpenTools}
+        onPageChange={handlePageChange}
+      />
+
+      {/* Main Content */}
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
+        {/* Custom Title Bar */}
+        <TitleBar platform={platform} />
+
+        <div className="h-full flex-1 overflow-y-auto overflow-x-hidden">
+          <Routes>
+            <Route
+              element={
+                <Home
+                  appVersion={appVersion}
+                  onOpenAbout={() => handlePageChange('about')}
+                  onOpenCookiesSettings={handleOpenCookiesSettings}
+                  onOpenSettings={() => handlePageChange('settings')}
+                  onOpenSupportedSites={handleOpenSupportedSites}
+                />
+              }
+              path="/"
+            />
+            <Route element={<Subscriptions />} path="/subscriptions" />
+            <Route element={<Settings />} path="/settings" />
+            <Route element={<About />} path="/about" />
+            <Route element={<Navigate replace to="/" />} path="*" />
+          </Routes>
+        </div>
+      </main>
+
+      <Toaster richColors={true} />
+    </div>
+  )
+}
+
+function App() {
+  return (
+    <ErrorBoundary>
+      <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
+        <HashRouter>
+          <AppContent />
+        </HashRouter>
+      </ThemeProvider>
+    </ErrorBoundary>
+  )
+}
+
+export default App

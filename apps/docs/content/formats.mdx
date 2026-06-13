@@ -1,0 +1,33 @@
+---
+title: Formats & Containers
+description: Pick the output container for one-click downloads (Auto, MP4, MKV, WebM, Original) and understand the trade-offs.
+---
+
+VidBee saves merged video downloads as MP4 by default and falls back to MKV when codecs aren't compatible. You can override this from **Settings → One-Click Download → Container**.
+
+## Container options
+
+| Option | yt-dlp behavior | When to choose |
+|---|---|---|
+| **Auto (MP4/MKV)** | `--merge-output-format mp4/mkv` — prefer MP4, fall back to MKV when codecs cannot be muxed into MP4. | Default. Maximizes compatibility while avoiding mux failures (e.g. HEVC + Hi-Res audio on bilibili, WebM fragments on YouTube). |
+| **MP4** | `--merge-output-format mp4 --remux-video mp4` | You need MP4 specifically (most compatible with QuickTime, iOS, social uploads). May fail on streams whose codecs MP4 cannot carry — switch back to **Auto** if you hit a `Conversion failed` error. |
+| **MKV** | `--merge-output-format mkv --remux-video mkv` | Most permissive container. Carries any codec yt-dlp can deliver. |
+| **WebM** | `--merge-output-format webm --remux-video webm` | Smallest files for VP9/AV1 + Opus streams from YouTube. Will fail when remote sources are AAC/H.264 only. |
+| **Original (yt-dlp default)** | No `--merge-output-format` flag. | You want yt-dlp's built-in defaults (MKV when merging, source extension when single-stream). |
+
+## Audio downloads
+
+Container selection only applies to **video** downloads. One-click audio downloads continue to use the platform's preferred audio container (typically M4A/MP3/Opus).
+
+## Where the setting lives
+
+- **Desktop**: Settings → General → One-Click Download card → Container.
+- **Web**: Settings page → One-Click Download → Container.
+
+The setting is persisted instantly and applied to both manual one-click downloads and RSS subscription downloads.
+
+## When MP4 still ends up as MKV
+
+When **Auto** is selected and the source codec/audio combination cannot be muxed into MP4, yt-dlp writes an MKV file with the original codecs to avoid quality loss. To force MP4 anyway, switch the container to **MP4**; the download will fail with a clear codec error if it can't be muxed, instead of silently choosing MKV.
+
+If you need MP4 from a non-MP4 source without losing the download, the alternative is to re-encode (slow, lossy). VidBee currently uses remux only — re-encoding is intentionally not exposed.

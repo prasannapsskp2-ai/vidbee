@@ -1,0 +1,33 @@
+---
+title: 格式与容器
+description: 选择一键下载的输出容器（自动 / MP4 / MKV / WebM / 原始），并了解每种选择的取舍。
+---
+
+VidBee 在合并视频下载时默认输出 MP4，编码不兼容时自动回落到 MKV。可以在 **设置 → 一键下载 → 容器格式** 中切换。
+
+## 容器选项
+
+| 选项 | yt-dlp 行为 | 适用场景 |
+|---|---|---|
+| **自动 (MP4/MKV)** | `--merge-output-format mp4/mkv` —— 优先 MP4，无法合入 MP4 时回落到 MKV。 | 默认值。在保留兼容性的同时避免 mux 失败（如 bilibili 的 HEVC + Hi-Res 音轨、YouTube 的 WebM 分片）。 |
+| **MP4** | `--merge-output-format mp4 --remux-video mp4` | 必须要 MP4 时（QuickTime、iOS、社交平台上传等场景兼容性最好）。源流编码 MP4 装不下时会失败 —— 看到 `Conversion failed` 时切回 **自动**。 |
+| **MKV** | `--merge-output-format mkv --remux-video mkv` | 最宽容的容器，能装下 yt-dlp 抓到的任意编码。 |
+| **WebM** | `--merge-output-format webm --remux-video webm` | YouTube 的 VP9/AV1 + Opus 配置体积最小。源仅有 AAC/H.264 时会失败。 |
+| **原始格式 (yt-dlp 默认)** | 不带 `--merge-output-format` 参数。 | 想完全跟随 yt-dlp 自身的默认（合并时取 MKV，单流时保留源扩展名）。 |
+
+## 音频下载
+
+容器设置只对 **视频** 生效。一键音频下载继续沿用平台首选的音频容器（通常是 M4A / MP3 / Opus）。
+
+## 设置入口
+
+- **桌面端**：设置 → 通用 → 一键下载卡片 → 容器格式。
+- **Web 端**：设置页 → 一键下载 → 容器格式。
+
+设置即时生效，对手动一键下载和 RSS 订阅下载都生效。
+
+## 选了 MP4 但仍输出 MKV？
+
+**自动** 模式下如果源端的编码/音轨组合无法合成 MP4，yt-dlp 会保留原始编码写入 MKV 以避免质量损失。如果一定要 MP4，把容器改成 **MP4** 后下载，遇到无法合并的源会直接报错，不会再静默写 MKV。
+
+如果一定要把非 MP4 源转成 MP4 又不想失败，只能走重编码（慢且有损）。VidBee 当前只暴露 remux，不提供 recode。

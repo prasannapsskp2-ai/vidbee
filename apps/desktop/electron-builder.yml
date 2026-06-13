@@ -1,0 +1,68 @@
+appId: com.vidbee
+productName: VidBee
+directories:
+  buildResources: build
+afterPack: build/after-pack.cjs
+protocols:
+  - name: VidBee
+    schemes:
+      - vidbee
+files:
+  - '!**/.vscode/*'
+  - '!**/.context/**'
+  - '!**/.github/**'
+  - '!node_modules/@vidbee/downloader-core{,/**}'
+  - '!node_modules/.pnpm/@vidbee+downloader-core@*/**'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.eslintcache,eslint.config.mjs,dev-app-update.yml}'
+  - '!changelogs/**'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  # Issue #103: keep desktop binaries out of app.asar to avoid duplicated resource packaging.
+  - '!resources{,/**}'
+extraResources:
+  - from: resources
+    to: resources
+    filter:
+      - '**/*'
+  # NOTE: VidBee CLI is now distributed standalone via npm / brew / shell
+  # installer (NEX-148). Desktop no longer bundles `@vidbee/cli` and no
+  # longer ships a `vidbee` shim. Users install the CLI explicitly with
+  # `npm install -g @vidbee/cli` (or one of the other channels).
+win:
+  executableName: vidbee
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+mac:
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: true
+  artifactName: ${name}-${version}-${arch}.${ext}
+  target:
+    - target: zip
+      arch:
+        - arm64
+        - x64
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+linux:
+  target:
+    - AppImage
+    - deb
+  maintainer: nexmoex@gmail.com
+  category: Utility
+appImage:
+  artifactName: ${name}-${version}.${ext}
+npmRebuild: true
+publish:
+  provider: generic
+  url: https://github.com/nexmoe/vidbee/releases/latest/download
+electronLanguages:
+  - en

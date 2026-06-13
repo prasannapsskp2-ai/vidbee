@@ -1,0 +1,885 @@
+import { existsSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve } from 'node:path'
+import { electronApp, optimizer } from '@electron-toolkit/utils'
+import { APP_PROTOCOL, APP_PROTOCOL_SCHEME } from '@shared/constants'
+import {
+  app,
+  BrowserWindow,
+  type BrowserWindowConstructorOptions,
+  ipcMain,
+  protocol,
+  shell
+} from 'electron'
+import log from 'electron-log/main'
+import { autoUpdater } from 'electron-updater'
+import appIcon from '../../build/icon.png?asset'
+import { classifyDownloadError } from '../shared/telemetry/yt-dlp-error-classifier'
+import {
+  buildAudioFormatPreference,
+  buildVideoFormatPreference
+} from '../shared/utils/format-preferences'
+import {
+  buildVideoInfoDownloadMetadata,
+  pickOneClickSelectedFormat
+} from '../shared/utils/video-info-metadata'
+import { configureLogger } from './config/logger-config'
+import { services } from './ipc'
+import { downloadEngine } from './lib/download-facade'
+import { ffmpegManager } from './lib/ffmpeg-manager'
+import {
+  addMainBreadcrumb,
+  captureMainException,
+  captureMainMessage,
+  initGlitchTipMain
+} from './lib/glitchtip'
+import { initializeOptionalTool } from './lib/startup-dependencies'
+import {
+  getDesktopSubscriptions,
+  listDesktopSubscriptionsSnapshot,
+  startDesktopSubscriptions,
+  stopDesktopSubscriptions
+} from './lib/subscriptions-host'
+import { runDesktopTaskQueueMigration } from './lib/task-queue-migrate'
+import { ytdlpManager } from './lib/ytdlp-manager'
+import { startExtensionApiServer, stopExtensionApiServer } from './local-api'
+import { settingsManager } from './settings'
+import { createTray, destroyTray } from './tray'
+import { applyAutoLaunchSetting } from './utils/auto-launch'
+import { applyDockVisibility } from './utils/dock'
+
+// NEX-131 §5.4: tray-only mode. Set when launched via the CLI / autostart so
+// the main window stays hidden until the user clicks the tray icon.
+const isBackgroundLaunch = (argv: string[]): boolean =>
+  argv.some((arg) => arg === '--background' || arg === '--from-cli')
+
+const BACKGROUND_MODE = isBackgroundLaunch(process.argv)
+
+// Initialize electron-log for main process
+log.initialize()
+
+// Configure logger settings
+configureLogger()
+initGlitchTipMain()
+
+process.on('uncaughtException', (error) => {
+  log.error('Main process uncaught exception:', error)
+  captureMainException(error, {
+    tags: {
+      source: 'process.uncaughtException'
+    }
+  })
+})
+
+process.on('unhandledRejection', (reason) => {
+  log.error('Main process unhandled rejection:', reason)
+  captureMainException(reason, {
+    tags: {
+      source: 'process.unhandledRejection'
+    }
+  })
+})
+
+if (process.platform === 'linux') {
+  // Force fallback to native GTK/KDE file dialogs when desktop portal is too old.
+  // This avoids folder selection issues on older Linux distributions.
+  app.commandLine.appendSwitch('xdg-portal-required-version', '4')
+}
+
+const RENDERER_DIST_PATH = join(import.meta.dirname, '../renderer')
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: APP_PROTOCOL,
+    privileges: {
+      secure: true,
+      standard: true,
+      supportFetchAPI: true
+    }
+  }
+])
+
+let mainWindow: BrowserWindow | null = null
+let isQuitting = false
+let isYtdlpReady = false
+interface DeepLinkData {
+  url: string
+  type: 'single' | 'playlist'
+}
+const pendingDeepLinkUrls: DeepLinkData[] = []
+const pendingOneClickDownloads: DeepLinkData[] = []
+let isRendererReady = false
+
+const getActiveMainWindow = (): BrowserWindow | null => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return null
+  }
+  if (mainWindow.webContents.isDestroyed()) {
+    return null
+  }
+  return mainWindow
+}
+
+const sendToRenderer = (channel: string, ...args: unknown[]): void => {
+  const window = getActiveMainWindow()
+  if (!window) {
+    return
+  }
+  try {
+    window.webContents.send(channel, ...args)
+  } catch (error) {
+    log.warn('Failed to send message to renderer:', channel, error)
+  }
+}
+
+const parseDownloadDeepLink = (rawUrl: string): DeepLinkData | null => {
+  try {
+    const parsed = new URL(rawUrl)
+    if (parsed.protocol !== `${APP_PROTOCOL}:`) {
+      return null
+    }
+
+    const host = parsed.hostname
+    const path = parsed.pathname.replace(/^\/+/, '')
+    const isDownloadLink = host === 'download' || path.startsWith('download')
+    if (!isDownloadLink) {
+      return null
+    }
+
+    const targetUrl = parsed.searchParams.get('url')
+    if (!targetUrl?.trim()) {
+      return null
+    }
+
+    const typeParam = parsed.searchParams.get('type')
+    const type = typeParam === 'playlist' ? 'playlist' : 'single'
+
+    return {
+      url: targetUrl.trim(),
+      type
+    }
+  } catch (error) {
+    log.warn('Failed to parse deep link:', error)
+    return null
+  }
+}
+
+const deliverDeepLink = (data: DeepLinkData): void => {
+  const window = getActiveMainWindow()
+  if (!(window && isRendererReady)) {
+    pendingDeepLinkUrls.push(data)
+    return
+  }
+
+  if (window.isMinimized()) {
+    window.restore()
+  }
+  if (!window.isVisible()) {
+    window.show()
+  }
+  window.focus()
+  sendToRenderer('download:deeplink', data)
+}
+
+const flushPendingDeepLinks = (): void => {
+  if (!(getActiveMainWindow() && isRendererReady) || pendingDeepLinkUrls.length === 0) {
+    return
+  }
+
+  const pending = pendingDeepLinkUrls.splice(0, pendingDeepLinkUrls.length)
+  for (const data of pending) {
+    sendToRenderer('download:deeplink', data)
+  }
+}
+
+const handleDeepLinkUrl = (rawUrl: string): void => {
+  const data = parseDownloadDeepLink(rawUrl)
+  if (!data) {
+    log.warn('Ignored unsupported deep link:', rawUrl)
+    addMainBreadcrumb('deeplink', 'Ignored unsupported deep link', {
+      url: rawUrl
+    })
+    return
+  }
+  addMainBreadcrumb('deeplink', 'Received deep link', {
+    type: data.type,
+    url: data.url
+  })
+  if (settingsManager.get('oneClickDownload')) {
+    queueOneClickDownload(data)
+    return
+  }
+  deliverDeepLink(data)
+}
+
+const handleDeepLinkArgv = (argv: string[]): void => {
+  for (const arg of argv) {
+    if (arg.startsWith(`${APP_PROTOCOL}://`)) {
+      handleDeepLinkUrl(arg)
+    }
+  }
+}
+
+// NEX-132 Phase B: bridge `SubscriptionsApi.on('changed')` → renderer's
+// legacy `subscriptions:updated` IPC event so the existing UI keeps working
+// while it migrates to task-queue-derived subscription item state.
+getDesktopSubscriptions().on('changed', () => {
+  void listDesktopSubscriptionsSnapshot()
+    .then((snapshot) => sendToRenderer('subscriptions:updated', snapshot))
+    .catch((err) => log.warn('Failed to broadcast subscriptions:updated:', err))
+})
+
+export function createWindow(): void {
+  const isMac = process.platform === 'darwin'
+  const isWindows = process.platform === 'win32'
+  const shouldStartHidden =
+    BACKGROUND_MODE || (isWindows && app.getLoginItemSettings().wasOpenedAtLogin)
+
+  const windowOptions: BrowserWindowConstructorOptions = {
+    width: 1200,
+    height: 800,
+    show: false,
+    autoHideMenuBar: true,
+    icon: appIcon, // Set application icon
+    frame: false,
+    webPreferences: {
+      preload: join(import.meta.dirname, '../preload/index.js'),
+      sandbox: false,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: false // Allow drag regions to work
+    }
+  }
+
+  if (isMac) {
+    windowOptions.titleBarStyle = 'hidden'
+    windowOptions.trafficLightPosition = { x: 12.5, y: 10 }
+    windowOptions.vibrancy = 'fullscreen-ui'
+  }
+
+  if (isWindows) {
+    windowOptions.backgroundMaterial = 'acrylic'
+  }
+
+  // Create the browser window
+  mainWindow = new BrowserWindow(windowOptions)
+
+  mainWindow.on('close', (event) => {
+    const closeToTray = settingsManager.get('closeToTray')
+    if (closeToTray && !isQuitting) {
+      event.preventDefault()
+      mainWindow?.hide()
+    }
+  })
+
+  mainWindow.on('closed', () => {
+    mainWindow = null
+    isRendererReady = false
+    applyDockVisibility(settingsManager.get('hideDockIcon'))
+  })
+
+  mainWindow.on('show', () => {
+    applyDockVisibility(settingsManager.get('hideDockIcon'))
+  })
+
+  mainWindow.on('hide', () => {
+    applyDockVisibility(settingsManager.get('hideDockIcon'))
+  })
+
+  mainWindow.on('ready-to-show', () => {
+    if (shouldStartHidden) {
+      applyDockVisibility(settingsManager.get('hideDockIcon'))
+      return
+    }
+    mainWindow?.show()
+  })
+
+  mainWindow.webContents.setWindowOpenHandler((details) => {
+    shell.openExternal(details.url)
+    return { action: 'deny' }
+  })
+
+  // HMR for renderer base on electron-vite cli.
+  // Load the remote URL for development or the local html file for production.
+  if (process.env.ELECTRON_RENDERER_URL) {
+    mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
+  } else {
+    mainWindow.loadURL(`${APP_PROTOCOL_SCHEME}renderer/index.html`)
+  }
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    void listDesktopSubscriptionsSnapshot()
+      .then((snapshot) => sendToRenderer('subscriptions:updated', snapshot))
+      .catch((err) => log.warn('Failed to send initial subscriptions snapshot:', err))
+    isRendererReady = true
+    flushPendingDeepLinks()
+  })
+
+  // Setup error handling for renderer process
+  setupRendererErrorHandling()
+
+  // Setup download engine event forwarding to renderer
+  setupDownloadEvents()
+}
+
+function setupRendererErrorHandling(): void {
+  if (!mainWindow) {
+    return
+  }
+
+  // Sentry issue VIDBEE-H8: Electron emits `unresponsive` for transient hangs
+  // too. Only capture freezes that actually exceed the 5s threshold so the
+  // signal isn't drowned out by short main-thread blips, and report the
+  // measured duration so we can tell a 6s blip apart from a 60s lockup.
+  const RENDERER_UNRESPONSIVE_REPORT_MS = 5000
+  let unresponsiveSince: number | null = null
+  let unresponsiveTimer: NodeJS.Timeout | null = null
+  let unresponsiveReported = false
+
+  mainWindow.webContents.on('unresponsive', () => {
+    log.error('Renderer process became unresponsive')
+    addMainBreadcrumb('renderer', 'Renderer process became unresponsive', undefined, 'warning')
+    unresponsiveSince = Date.now()
+    unresponsiveReported = false
+    if (unresponsiveTimer) {
+      clearTimeout(unresponsiveTimer)
+    }
+    unresponsiveTimer = setTimeout(() => {
+      unresponsiveTimer = null
+      if (unresponsiveSince === null) {
+        return
+      }
+      unresponsiveReported = true
+      captureMainMessage(
+        'Renderer process unresponsive (sustained)',
+        {
+          extra: {
+            unresponsive_ms_at_capture: Date.now() - unresponsiveSince,
+            threshold_ms: RENDERER_UNRESPONSIVE_REPORT_MS
+          },
+          tags: {
+            source: 'renderer.unresponsive'
+          }
+        },
+        'warning'
+      )
+    }, RENDERER_UNRESPONSIVE_REPORT_MS)
+  })
+
+  mainWindow.webContents.on('responsive', () => {
+    const duration = unresponsiveSince === null ? null : Date.now() - unresponsiveSince
+    log.info('Renderer process became responsive again')
+    addMainBreadcrumb('renderer', 'Renderer process became responsive again', {
+      unresponsive_ms: duration ?? undefined,
+      reported_to_sentry: unresponsiveReported
+    })
+    if (unresponsiveTimer) {
+      clearTimeout(unresponsiveTimer)
+      unresponsiveTimer = null
+    }
+    if (unresponsiveReported && duration !== null) {
+      captureMainMessage(
+        'Renderer process recovered from sustained unresponsiveness',
+        {
+          extra: { unresponsive_ms: duration },
+          tags: { source: 'renderer.unresponsive' }
+        },
+        'info'
+      )
+    }
+    unresponsiveSince = null
+    unresponsiveReported = false
+  })
+
+  // Listen for renderer errors via IPC
+  ipcMain.on('error:renderer', (_event, errorData) => {
+    log.error('Renderer error received:', errorData)
+
+    // Log detailed error information
+    if (errorData.error) {
+      log.error('Error name:', errorData.error.name)
+      log.error('Error message:', errorData.error.message)
+      if (errorData.error.stack) {
+        log.error('Error stack:', errorData.error.stack)
+      }
+    }
+
+    if (errorData.errorInfo?.componentStack) {
+      log.error('Component stack:', errorData.errorInfo.componentStack)
+    }
+
+    if (errorData.context) {
+      log.error('Error context:', errorData.context)
+    }
+
+    const rendererError =
+      errorData?.error && typeof errorData.error === 'object'
+        ? new Error(errorData.error.message ?? 'Unknown renderer error')
+        : new Error('Unknown renderer error')
+
+    if (errorData?.error?.stack) {
+      rendererError.stack = errorData.error.stack
+    }
+
+    captureMainException(rendererError, {
+      extra: {
+        componentStack: errorData?.errorInfo?.componentStack,
+        rendererContext: errorData?.context,
+        timestamp: errorData?.timestamp
+      },
+      fingerprint: ['renderer-error', errorData?.error?.name ?? 'Error'],
+      tags: {
+        error_name: errorData?.error?.name ?? 'Error',
+        source: 'renderer.ipc'
+      }
+    })
+  })
+}
+
+function setupDownloadEvents(): void {
+  downloadEngine.on('download-queued', (item: unknown) => {
+    addMainBreadcrumb('download', 'Download queued')
+    sendToRenderer('download:queued', item)
+  })
+
+  downloadEngine.on('download-updated', (id: string, updates: unknown) => {
+    sendToRenderer('download:updated', { id, updates })
+  })
+
+  downloadEngine.on('download-started', (id: string) => {
+    addMainBreadcrumb('download', 'Download started', { downloadId: id })
+    sendToRenderer('download:started', id)
+  })
+
+  downloadEngine.on('download-progress', (id: string, progress: unknown) => {
+    sendToRenderer('download:progress', { id, progress })
+  })
+
+  downloadEngine.on('download-log', (id: string, logText: string) => {
+    sendToRenderer('download:log', { id, log: logText })
+  })
+
+  downloadEngine.on('download-completed', (id: string) => {
+    addMainBreadcrumb('download', 'Download completed', { downloadId: id })
+    sendToRenderer('download:completed', id)
+  })
+
+  downloadEngine.on('download-error', (id: string, error: Error) => {
+    // Sentry issue VIDBEE-68: classify the error so operational failures (yt-dlp
+    // postprocessing, upstream HTTP / DRM / cookies) drop out of telemetry and
+    // genuine bugs get a stable category tag.
+    const { category, isOperational } = classifyDownloadError(error)
+    const glitchTipEventId = isOperational
+      ? undefined
+      : captureMainException(error, {
+          fingerprint: ['download-error', category, error.name, error.message],
+          tags: {
+            download_id: id,
+            download_error_category: category,
+            source: 'download-engine'
+          }
+        })
+    if (glitchTipEventId) {
+      downloadEngine.updateDownloadInfo(id, { glitchTipEventId })
+    }
+    sendToRenderer('download:error', { id, error: error.message })
+  })
+
+  downloadEngine.on('download-cancelled', (id: string) => {
+    sendToRenderer('download:cancelled', id)
+  })
+}
+
+const createDownloadId = (): string =>
+  `download_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`
+
+const queueOneClickDownload = (data: DeepLinkData): void => {
+  if (!isYtdlpReady) {
+    pendingOneClickDownloads.push(data)
+    return
+  }
+  void startOneClickDownload(data)
+}
+
+const flushPendingOneClickDownloads = (): void => {
+  if (!isYtdlpReady || pendingOneClickDownloads.length === 0) {
+    return
+  }
+  const pending = pendingOneClickDownloads.splice(0, pendingOneClickDownloads.length)
+  for (const data of pending) {
+    void startOneClickDownload(data)
+  }
+}
+
+const startOneClickDownload = async (data: DeepLinkData): Promise<void> => {
+  try {
+    const settings = settingsManager.getAll()
+    const downloadType = settings.oneClickDownloadType ?? 'video'
+    const format =
+      downloadType === 'video'
+        ? buildVideoFormatPreference(settings)
+        : buildAudioFormatPreference(settings)
+
+    const containerFormat =
+      downloadType === 'video' ? (settings.oneClickContainer ?? 'auto') : undefined
+
+    if (data.type === 'playlist') {
+      const result = await downloadEngine.startPlaylistDownload({
+        url: data.url,
+        type: downloadType,
+        format,
+        containerFormat
+      })
+      log.info('One-click playlist download queued:', {
+        url: data.url,
+        count: result.totalCount
+      })
+      addMainBreadcrumb('download', 'One-click playlist download queued', {
+        count: result.totalCount,
+        type: data.type,
+        url: data.url
+      })
+      return
+    }
+
+    const downloadId = createDownloadId()
+    let downloadUrl = data.url
+    let metadata = {}
+
+    try {
+      const info = await downloadEngine.getVideoInfo(data.url)
+      downloadUrl = info.webpage_url?.trim() || data.url
+      metadata = {
+        ...buildVideoInfoDownloadMetadata(info),
+        selectedFormat: pickOneClickSelectedFormat(info, {
+          oneClickDownloadType: downloadType,
+          oneClickQuality: settings.oneClickQuality
+        })
+      }
+    } catch (error) {
+      log.warn('Failed to fetch one-click video info before queueing:', error)
+    }
+
+    const started = downloadEngine.startDownload(downloadId, {
+      url: downloadUrl,
+      type: downloadType,
+      format,
+      containerFormat,
+      ...metadata
+    })
+    if (started) {
+      log.info('One-click download queued:', { id: downloadId, url: downloadUrl })
+      addMainBreadcrumb('download', 'One-click download queued', {
+        downloadId,
+        type: data.type,
+        url: downloadUrl
+      })
+    } else {
+      log.info('One-click download already queued:', { id: downloadId, url: downloadUrl })
+      addMainBreadcrumb('download', 'One-click download was already queued', {
+        downloadId,
+        url: downloadUrl
+      })
+    }
+  } catch (error) {
+    log.error('Failed to start one-click download:', error)
+    captureMainException(error, {
+      extra: {
+        deepLink: data
+      },
+      tags: {
+        source: 'one-click-download'
+      }
+    })
+  }
+}
+
+function sanitizeRequestPath(requestUrl: URL): string {
+  const rawPath = `${requestUrl.hostname}${decodeURIComponent(requestUrl.pathname)}`
+  const trimmedLeading = rawPath.replace(/^\/+/, '')
+  const cleaned = trimmedLeading.replace(/\/+$/, '')
+  return cleaned || 'index.html'
+}
+
+function isWithinBase(targetPath: string, basePath: string): boolean {
+  const relativePath = relative(basePath, targetPath)
+  return !(relativePath.startsWith('..') || isAbsolute(relativePath))
+}
+
+function resolveVidbeeFilePath(requestUrl: URL, userDataPath: string): string | null {
+  const sanitizedPath = sanitizeRequestPath(requestUrl)
+  const [rootSegment, ...restSegments] = sanitizedPath.split('/')
+  const rendererPath = restSegments.join('/') || 'index.html'
+
+  if (rootSegment === 'renderer') {
+    const rendererTarget = resolve(RENDERER_DIST_PATH, rendererPath)
+
+    if (isWithinBase(rendererTarget, RENDERER_DIST_PATH) && existsSync(rendererTarget)) {
+      return rendererTarget
+    }
+  }
+
+  const userDataTarget = resolve(userDataPath, sanitizedPath)
+
+  if (isWithinBase(userDataTarget, userDataPath) && existsSync(userDataTarget)) {
+    return userDataTarget
+  }
+
+  const rendererFallback = resolve(RENDERER_DIST_PATH, sanitizedPath)
+
+  if (isWithinBase(rendererFallback, RENDERER_DIST_PATH) && existsSync(rendererFallback)) {
+    return rendererFallback
+  }
+
+  return null
+}
+
+function registerVidbeeProtocol(): void {
+  try {
+    const userDataPath = app.getPath('userData')
+    protocol.registerFileProtocol(APP_PROTOCOL, (request, callback) => {
+      const requestUrl = new URL(request.url)
+      const filePath = resolveVidbeeFilePath(requestUrl, userDataPath)
+
+      if (!filePath) {
+        log.error(`File not found for ${request.url}`)
+        callback({ error: -6 })
+        return
+      }
+
+      callback(filePath)
+    })
+  } catch (error) {
+    log.error(`Failed to register ${APP_PROTOCOL} protocol:`, error)
+  }
+}
+
+function initAutoUpdater(): void {
+  try {
+    log.info('Initializing auto-updater...')
+
+    log.transports.file.level = 'info'
+    autoUpdater.logger = log
+    autoUpdater.autoDownload = true
+    autoUpdater.autoInstallOnAppQuit = true
+
+    autoUpdater.on('update-available', (info) => {
+      log.info('Update available:', info.version)
+      addMainBreadcrumb('update', 'Update available', {
+        version: info.version
+      })
+      sendToRenderer('update:available', info)
+      log.info('Automatic updates are required, update will download in the background')
+    })
+
+    autoUpdater.on('update-not-available', (info) => {
+      log.info('Update not available:', info.version)
+      sendToRenderer('update:not-available', info)
+    })
+
+    autoUpdater.on('error', (err) => {
+      log.error('Update error:', err)
+      captureMainException(err, {
+        tags: {
+          source: 'auto-updater'
+        }
+      })
+      sendToRenderer('update:error', err.message)
+    })
+
+    autoUpdater.on('download-progress', (progressObj) => {
+      log.info('Download progress:', progressObj.percent)
+      sendToRenderer('update:download-progress', progressObj)
+    })
+
+    autoUpdater.on('update-downloaded', (info) => {
+      log.info('Update downloaded:', info.version)
+      addMainBreadcrumb('update', 'Update downloaded', {
+        version: info.version
+      })
+      sendToRenderer('update:downloaded', info)
+    })
+
+    log.info('Auto-updater initialized successfully')
+    log.info('Automatic updates are required, checking for updates immediately...')
+    // Use checkForUpdates instead of checkForUpdatesAndNotify
+    // because we have our own notification system and want to ensure immediate download
+    void autoUpdater.checkForUpdates()
+  } catch (error) {
+    log.error('Failed to initialize auto-updater:', error)
+    captureMainException(error, {
+      tags: {
+        source: 'auto-updater.init'
+      }
+    })
+  }
+}
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (gotSingleInstanceLock) {
+  app.on('second-instance', (_event, argv) => {
+    handleDeepLinkArgv(argv)
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore()
+      }
+      mainWindow.show()
+      mainWindow.focus()
+    }
+  })
+} else {
+  app.quit()
+}
+
+app.on('open-url', (event, url) => {
+  event.preventDefault()
+  handleDeepLinkUrl(url)
+})
+
+// This method will be called when Electron has finished
+// initialization and is ready to create browser windows.
+// Some APIs can only be used after this event occurs.
+app.whenReady().then(async () => {
+  // Set app user model id for windows
+  electronApp.setAppUserModelId('com.vidbee')
+
+  registerVidbeeProtocol()
+
+  const registered = app.setAsDefaultProtocolClient(APP_PROTOCOL)
+  if (!registered) {
+    log.warn(`Failed to register ${APP_PROTOCOL} protocol handler`)
+  }
+
+  // Default open or close DevTools by F12 in development
+  // and ignore CommandOrControl + R in production.
+  app.on('browser-window-created', (_, window) => {
+    optimizer.watchWindowShortcuts(window)
+
+    // Enable F12 to toggle DevTools in both development and production
+    window.webContents.on('before-input-event', (_, input) => {
+      if (input.key === 'F12') {
+        if (window.webContents.isDevToolsOpened()) {
+          window.webContents.closeDevTools()
+        } else {
+          window.webContents.openDevTools()
+        }
+      }
+    })
+  })
+
+  // IPC services are automatically registered by electron-ipc-decorator when imported
+  log.info('IPC services available:', Object.keys(services))
+
+  await initializeOptionalTool({
+    initialize: () => ffmpegManager.initialize(),
+    label: 'ffmpeg',
+    logger: log
+  })
+
+  // Initialize yt-dlp
+  try {
+    log.info('Initializing yt-dlp...')
+    await ytdlpManager.initialize()
+    isYtdlpReady = true
+    log.info('yt-dlp initialized successfully')
+  } catch (error) {
+    log.error('Failed to initialize yt-dlp:', error)
+    captureMainException(error, {
+      tags: {
+        source: 'ytdlp.initialize'
+      }
+    })
+  }
+
+  if (isYtdlpReady) {
+    downloadEngine.restoreActiveDownloads()
+    flushPendingOneClickDownloads()
+  }
+
+  // NEX-131 A段: copy any pre-existing download-session.json + legacy
+  // download_history rows into the new task-queue tasks table. Idempotent;
+  // safe to run on every boot. Non-fatal if it fails.
+  try {
+    runDesktopTaskQueueMigration()
+  } catch (err) {
+    log.warn('Desktop task-queue migration failed:', err)
+  }
+
+  await startExtensionApiServer()
+
+  if (BACKGROUND_MODE) {
+    addMainBreadcrumb('app', 'Started in --background tray-only mode')
+    log.info('Desktop launched with --background; main window will stay hidden')
+  }
+
+  applyAutoLaunchSetting(settingsManager.get('launchAtLogin'))
+
+  createWindow()
+
+  initAutoUpdater()
+
+  // Create system tray
+  createTray()
+
+  try {
+    await startDesktopSubscriptions()
+  } catch (err) {
+    log.warn('Desktop subscriptions failed to start:', err)
+  }
+
+  handleDeepLinkArgv(process.argv)
+
+  app.on('activate', () => {
+    const existingWindow = BrowserWindow.getAllWindows().find((window) => !window.isDestroyed())
+    if (existingWindow) {
+      if (existingWindow.isMinimized()) {
+        existingWindow.restore()
+      }
+      if (!existingWindow.isVisible()) {
+        existingWindow.show()
+      }
+      existingWindow.focus()
+      return
+    }
+
+    // On macOS it's common to re-create a window in the app when the
+    // dock icon is clicked and there are no other windows open.
+    createWindow()
+  })
+})
+
+app.on('before-quit', () => {
+  isQuitting = true
+  downloadEngine.flushDownloadSession()
+})
+
+// Quit when all windows are closed, except on macOS. There, it's common
+// for applications and their menu bar to stay active until the user quits
+// explicitly with Cmd + Q.
+app.on('window-all-closed', () => {
+  const closeToTray = settingsManager.get('closeToTray')
+
+  if (process.platform !== 'darwin') {
+    if (closeToTray) {
+      // Hide to tray instead of quitting
+      const mainWindow = BrowserWindow.getAllWindows().find((window) => !window.isDestroyed())
+      if (mainWindow) {
+        mainWindow.hide()
+      }
+    } else {
+      app.quit()
+    }
+  }
+})
+
+// Cleanup tray on quit
+app.on('will-quit', () => {
+  destroyTray()
+  void stopExtensionApiServer()
+  void stopDesktopSubscriptions().catch((err) =>
+    log.warn('Failed to stop desktop subscriptions on quit:', err)
+  )
+})
+
+// In this file you can include the rest of your app's specific main process
+// code. You can also put them in separate files and require them here.

@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "orpc-contract-first": {
+      "source": "langgenius/dify",
+      "sourceType": "github",
+      "computedHash": "1e5b26066bf6e6ce8c5c1e5b3e1d62e7d231f013052fee2a12da6b3a76e8b183"
+    },
+    "release-pro-max": {
+      "source": "nexmoe/nexmoe-skills",
+      "sourceType": "github",
+      "computedHash": "a6358a5a340b924d46dddb2756b252b6bf05dbf60c85975b1e929203e80137f1"
+    }
+  }
+}

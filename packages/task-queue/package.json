@@ -1,0 +1,38 @@
+{
+  "name": "@vidbee/task-queue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./contract": "./src/contract.ts",
+    "./types": "./src/types.ts",
+    "./fsm": "./src/fsm/index.ts",
+    "./classifier": "./src/classifier/index.ts",
+    "./scheduler": "./src/scheduler/index.ts",
+    "./executor": "./src/executor/index.ts",
+    "./persist": "./src/persist/index.ts",
+    "./events": "./src/events/index.ts",
+    "./process": "./src/process/index.ts",
+    "./projection": "./src/projection/index.ts"
+  },
+  "types": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@orpc/contract": "^1.13.5",
+    "ulid": "^2.3.0",
+    "zod": "^4.1.11"
+  },
+  "peerDependencies": {
+    "@vidbee/db": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.6",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,80 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "useExhaustiveDependencies": "warn",
+        "useImageSize": "off"
+      },
+      "suspicious": {
+        "noExplicitAny": "warn",
+        "useAwait": "off",
+        "noEmptyBlockStatements": "off"
+      },
+      "style": {
+        "useConst": "error",
+        "noNestedTernary": "off",
+        "useFilenamingConvention": "off",
+        "noExportedImports": "off",
+        "useCollapsedElseIf": "off"
+      },
+      "complexity": {
+        "noForEach": "off",
+        "noVoid": "off",
+        "noExcessiveCognitiveComplexity": "off"
+      },
+      "performance": {
+        "useTopLevelRegex": "off",
+        "noNamespaceImport": "off"
+      },
+      "a11y": {
+        "noNoninteractiveElementInteractions": "off"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": true,
+    "formatWithErrors": false,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100,
+    "lineEnding": "lf"
+  },
+  "javascript": {
+    "globals": ["browser", "defineBackground"],
+    "formatter": {
+      "quoteStyle": "single",
+      "semicolons": "asNeeded",
+      "trailingCommas": "none",
+      "bracketSpacing": true,
+      "bracketSameLine": false,
+      "arrowParentheses": "always",
+      "quoteProperties": "asNeeded"
+    }
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": [
+      "**/*.ts",
+      "**/*.tsx",
+      "**/*.js",
+      "**/*.jsx",
+      "**/*.json",
+      "!apps/docs",
+      "!apps/desktop/build",
+      "!apps/desktop/dist",
+      "!apps/desktop/out",
+      "!dist",
+      "!out",
+      "!build"
+    ]
+  },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "extends": ["ultracite/biome/core", "ultracite/biome/react"]
+}
